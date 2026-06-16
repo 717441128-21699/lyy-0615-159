@@ -17,11 +17,100 @@ const (
 	StatusUnknown
 )
 
+type CircuitStatus int
+
+const (
+	CircuitClosed CircuitStatus = iota
+	CircuitOpen
+	CircuitHalfOpen
+)
+
+type RateLimiter struct {
+	capacity       int64
+	tokens         int64
+	refillAmount   int64
+	refillInterval time.Duration
+	lastRefill     time.Time
+	mu             sync.Mutex
+	enabled        bool
+}
+
+func NewRateLimiter(capacity int64, refillAmount int64, refillInterval time.Duration) *RateLimiter {
+	return &RateLimiter{
+		capacity:       capacity,
+		tokens:         capacity,
+		refillAmount:   refillAmount,
+		refillInterval: refillInterval,
+		lastRefill:     time.Now(),
+		enabled:        capacity > 0,
+	}
+}
+
+func (rl *RateLimiter) SetLimit(capacity int64, refillAmount int64, refillInterval time.Duration) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	rl.capacity = capacity
+	rl.refillAmount = refillAmount
+	rl.refillInterval = refillInterval
+	rl.tokens = capacity
+	rl.lastRefill = time.Now()
+	rl.enabled = capacity > 0
+}
+
+func (rl *RateLimiter) Disable() {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	rl.enabled = false
+}
+
+func (rl *RateLimiter) IsEnabled() bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	return rl.enabled
+}
+
+func (rl *RateLimiter) TryAcquire() bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	if !rl.enabled {
+		return true
+	}
+
+	now := time.Now()
+	elapsed := now.Sub(rl.lastRefill)
+	if elapsed >= rl.refillInterval {
+		refillCount := int64(elapsed / rl.refillInterval)
+		rl.tokens = min(rl.capacity, rl.tokens+refillCount*rl.refillAmount)
+		rl.lastRefill = now
+	}
+
+	if rl.tokens > 0 {
+		rl.tokens--
+		return true
+	}
+	return false
+}
+
+func (rl *RateLimiter) Config() (capacity int64, refillAmount int64, refillInterval time.Duration, enabled bool) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	return rl.capacity, rl.refillAmount, rl.refillInterval, rl.enabled
+}
+
+func min(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 type BackendStats struct {
-	TotalRequests  int64
-	TotalSuccesses int64
-	TotalFailures  int64
-	TotalLatencyNs int64
+	TotalRequests    int64
+	TotalSuccesses   int64
+	TotalFailures    int64
+	TotalLatencyNs  int64
+	TotalRateLimited int64
 
 	RecentRequests  int64
 	RecentSuccesses int64
@@ -55,6 +144,18 @@ type Backend struct {
 	totalSuccesses     int64
 	totalFailures      int64
 	totalLatencyNs     int64
+	totalRateLimited   int64
+
+	rateLimiter *RateLimiter
+
+	circuitStatus      CircuitStatus
+	circuitOpenSince   time.Time
+	circuitOpenReason  string
+	circuitOpenSeconds int
+	circuitConsecFails int
+	circuitFailThreshold int
+	circuitProbeSuccess int
+	circuitManualOpen  bool
 }
 
 func NewBackend(name, rawURL string, weight, failureThreshold, successThreshold int) (*Backend, error) {
@@ -63,12 +164,16 @@ func NewBackend(name, rawURL string, weight, failureThreshold, successThreshold 
 		return nil, fmt.Errorf("parse backend URL: %w", err)
 	}
 	return &Backend{
-		Name:              name,
-		URL:               u,
-		Weight:            weight,
-		status:            StatusUnknown,
-		failureThreshold:  failureThreshold,
-		successThreshold:  successThreshold,
+		Name:                    name,
+		URL:                     u,
+		Weight:                  weight,
+		status:                  StatusUnknown,
+		failureThreshold:        failureThreshold,
+		successThreshold:        successThreshold,
+		rateLimiter:             NewRateLimiter(0, 0, 0),
+		circuitFailThreshold:    5,
+		circuitOpenSeconds:      30,
+		circuitProbeSuccess:     2,
 	}, nil
 }
 
@@ -91,7 +196,155 @@ func (b *Backend) IsMaintenance() bool {
 func (b *Backend) IsEligible() bool {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	return !b.maintenance && b.status == StatusHealthy
+	return !b.maintenance && b.status == StatusHealthy && b.circuitStatus != CircuitOpen
+}
+
+func (b *Backend) CircuitStatus() CircuitStatus {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.circuitStatus
+}
+
+func (b *Backend) CircuitInfo() (status CircuitStatus, reason string, remainingSec int, openSince time.Time) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	remaining := 0
+	if b.circuitStatus == CircuitOpen && !b.circuitOpenSince.IsZero() {
+		elapsed := int(time.Since(b.circuitOpenSince).Seconds())
+		remaining = b.circuitOpenSeconds - elapsed
+		if remaining < 0 {
+			remaining = 0
+		}
+	}
+	return b.circuitStatus, b.circuitOpenReason, remaining, b.circuitOpenSince
+}
+
+func (b *Backend) SetCircuitThresholds(failThreshold int, openSeconds int, probeSuccess int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if failThreshold > 0 {
+		b.circuitFailThreshold = failThreshold
+	}
+	if openSeconds > 0 {
+		b.circuitOpenSeconds = openSeconds
+	}
+	if probeSuccess > 0 {
+		b.circuitProbeSuccess = probeSuccess
+	}
+}
+
+func (b *Backend) RecordCircuitSuccess() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.circuitConsecFails = 0
+	if b.circuitStatus == CircuitHalfOpen {
+		b.circuitProbeSuccess--
+		if b.circuitProbeSuccess <= 0 {
+			b.circuitStatus = CircuitClosed
+			b.circuitOpenReason = ""
+			b.circuitOpenSince = time.Time{}
+			fmt.Printf("Backend %s circuit CLOSED (probe successes reached threshold)\n", b.Name)
+		}
+	}
+}
+
+func (b *Backend) RecordCircuitFailure(err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.circuitStatus == CircuitHalfOpen {
+		b.circuitStatus = CircuitOpen
+		b.circuitOpenSince = time.Now()
+		b.circuitOpenReason = fmt.Sprintf("probe failed: %v", err)
+		b.circuitConsecFails = 0
+		fmt.Printf("Backend %s circuit RE-OPENED: probe failed\n", b.Name)
+		return
+	}
+
+	if b.circuitStatus == CircuitOpen {
+		return
+	}
+
+	b.circuitConsecFails++
+	if b.circuitConsecFails >= b.circuitFailThreshold && !b.circuitManualOpen {
+		b.circuitStatus = CircuitOpen
+		b.circuitOpenSince = time.Now()
+		b.circuitOpenReason = fmt.Sprintf("consecutive failures: %d, last: %v", b.circuitConsecFails, err)
+		b.circuitConsecFails = 0
+		fmt.Printf("Backend %s circuit OPENED: %s\n", b.Name, b.circuitOpenReason)
+	}
+}
+
+func (b *Backend) TryCircuitHalfOpen() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.circuitStatus != CircuitOpen || b.circuitManualOpen {
+		return false
+	}
+
+	elapsed := time.Since(b.circuitOpenSince)
+	if elapsed >= time.Duration(b.circuitOpenSeconds)*time.Second {
+		b.circuitStatus = CircuitHalfOpen
+		b.circuitConsecFails = 0
+		b.circuitProbeSuccess = b.circuitProbeSuccess
+		fmt.Printf("Backend %s circuit HALF-OPEN: starting probe\n", b.Name)
+		return true
+	}
+	return false
+}
+
+func (b *Backend) SetManualCircuitOpen(open bool, reason string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if open {
+		b.circuitManualOpen = true
+		b.circuitStatus = CircuitOpen
+		b.circuitOpenSince = time.Now()
+		if reason == "" {
+			reason = "manual operation"
+		}
+		b.circuitOpenReason = fmt.Sprintf("manual: %s", reason)
+		fmt.Printf("Backend %s circuit manually OPENED: %s\n", b.Name, b.circuitOpenReason)
+	} else {
+		b.circuitManualOpen = false
+		b.circuitStatus = CircuitClosed
+		b.circuitOpenReason = ""
+		b.circuitOpenSince = time.Time{}
+		b.circuitConsecFails = 0
+		fmt.Printf("Backend %s circuit manually CLOSED\n", b.Name)
+	}
+}
+
+func (b *Backend) TryAcquireRateLimit() bool {
+	ok := b.rateLimiter.TryAcquire()
+	if !ok {
+		b.statsMu.Lock()
+		b.totalRateLimited++
+		b.statsMu.Unlock()
+	}
+	return ok
+}
+
+func (b *Backend) SetRateLimit(capacity int64, refillAmount int64, refillInterval time.Duration) {
+	b.rateLimiter.SetLimit(capacity, refillAmount, refillInterval)
+	fmt.Printf("Backend %s rate limit set: capacity=%d, refill=%d/%s\n", b.Name, capacity, refillAmount, refillInterval)
+}
+
+func (b *Backend) DisableRateLimit() {
+	b.rateLimiter.Disable()
+	fmt.Printf("Backend %s rate limit disabled\n", b.Name)
+}
+
+func (b *Backend) RateLimitConfig() (capacity int64, refillAmount int64, refillInterval time.Duration, enabled bool) {
+	return b.rateLimiter.Config()
+}
+
+func (b *Backend) TotalRateLimited() int64 {
+	b.statsMu.Lock()
+	defer b.statsMu.Unlock()
+	return b.totalRateLimited
 }
 
 func (b *Backend) MaintenanceSince() time.Time {
@@ -176,10 +429,11 @@ func (b *Backend) Stats() BackendStats {
 	b.statsMu.Lock()
 	defer b.statsMu.Unlock()
 	return BackendStats{
-		TotalRequests:  b.totalRequests,
-		TotalSuccesses: b.totalSuccesses,
-		TotalFailures:  b.totalFailures,
-		TotalLatencyNs: b.totalLatencyNs,
+		TotalRequests:    b.totalRequests,
+		TotalSuccesses:   b.totalSuccesses,
+		TotalFailures:    b.totalFailures,
+		TotalLatencyNs:   b.totalLatencyNs,
+		TotalRateLimited: b.totalRateLimited,
 	}
 }
 
@@ -245,6 +499,8 @@ func (b *Backend) RecordRequestSuccess(latency time.Duration) {
 	b.lastRequestError = ""
 	b.mu.Unlock()
 
+	b.RecordCircuitSuccess()
+
 	b.statsMu.Lock()
 	b.totalRequests++
 	b.totalSuccesses++
@@ -261,6 +517,8 @@ func (b *Backend) RecordRequestFailure(err error, latency time.Duration) {
 		b.lastRequestError = "request failed"
 	}
 	b.mu.Unlock()
+
+	b.RecordCircuitFailure(err)
 
 	b.statsMu.Lock()
 	b.totalRequests++
@@ -443,15 +701,49 @@ func (hc *HealthChecker) check(b *Backend) {
 }
 
 type BackendPool struct {
-	mu       sync.RWMutex
-	backends []*Backend
-	checker  *HealthChecker
+	mu           sync.RWMutex
+	backends     []*Backend
+	checker      *HealthChecker
+	rateLimiter  *RateLimiter
+	statsMu      sync.Mutex
+	totalRateLimited int64
 }
 
 func NewBackendPool() *BackendPool {
 	return &BackendPool{
-		backends: make([]*Backend, 0),
+		backends:    make([]*Backend, 0),
+		rateLimiter: NewRateLimiter(0, 0, 0),
 	}
+}
+
+func (bp *BackendPool) TryAcquireGlobalRateLimit() bool {
+	ok := bp.rateLimiter.TryAcquire()
+	if !ok {
+		bp.statsMu.Lock()
+		bp.totalRateLimited++
+		bp.statsMu.Unlock()
+	}
+	return ok
+}
+
+func (bp *BackendPool) SetGlobalRateLimit(capacity int64, refillAmount int64, refillInterval time.Duration) {
+	bp.rateLimiter.SetLimit(capacity, refillAmount, refillInterval)
+	fmt.Printf("Global rate limit set: capacity=%d, refill=%d/%s\n", capacity, refillAmount, refillInterval)
+}
+
+func (bp *BackendPool) DisableGlobalRateLimit() {
+	bp.rateLimiter.Disable()
+	fmt.Println("Global rate limit disabled")
+}
+
+func (bp *BackendPool) GlobalRateLimitConfig() (capacity int64, refillAmount int64, refillInterval time.Duration, enabled bool) {
+	return bp.rateLimiter.Config()
+}
+
+func (bp *BackendPool) TotalGlobalRateLimited() int64 {
+	bp.statsMu.Lock()
+	defer bp.statsMu.Unlock()
+	return bp.totalRateLimited
 }
 
 func (bp *BackendPool) SetHealthChecker(hc *HealthChecker) {
@@ -525,12 +817,14 @@ type PoolStats struct {
 	TotalSuccesses    int64
 	TotalFailures     int64
 	TotalLatencyNs    int64
+	TotalRateLimited  int64
 	TotalActiveConns  int64
 	TotalBackends     int
 	HealthyBackends   int
 	EligibleBackends  int
 	MaintenanceBackends int
 	UnhealthyBackends int
+	CircuitOpenBackends int
 }
 
 func (bp *BackendPool) PoolStats() PoolStats {
@@ -539,22 +833,34 @@ func (bp *BackendPool) PoolStats() PoolStats {
 	copy(backends, bp.backends)
 	bp.mu.RUnlock()
 
+	bp.statsMu.Lock()
+	globalRL := bp.totalRateLimited
+	bp.statsMu.Unlock()
+
 	var ps PoolStats
 	ps.TotalBackends = len(backends)
+	ps.TotalRateLimited = globalRL
 	for _, b := range backends {
 		s := b.Stats()
 		ps.TotalRequests += s.TotalRequests
 		ps.TotalSuccesses += s.TotalSuccesses
 		ps.TotalFailures += s.TotalFailures
 		ps.TotalLatencyNs += s.TotalLatencyNs
+		ps.TotalRateLimited += s.TotalRateLimited
 		ps.TotalActiveConns += b.ActiveConns()
+
+		if b.CircuitStatus() == CircuitOpen {
+			ps.CircuitOpenBackends++
+		}
 
 		switch {
 		case b.IsMaintenance():
 			ps.MaintenanceBackends++
 		case b.IsHealthy():
 			ps.HealthyBackends++
-			ps.EligibleBackends++
+			if b.CircuitStatus() != CircuitOpen {
+				ps.EligibleBackends++
+			}
 		default:
 			ps.UnhealthyBackends++
 		}

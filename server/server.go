@@ -135,6 +135,7 @@ func (s *LoadBalancerServer) buildFromConfig(cfg *config.Config) error {
 		cfg.Retry.MaxRetries,
 		cfg.Retry.RetryOnStatus,
 		cfg.Retry.BackoffDuration(),
+		pool,
 	)
 
 	snap := &ServerSnapshot{
@@ -226,6 +227,7 @@ func (s *LoadBalancerServer) onConfigChange(oldCfg, newCfg *config.Config) {
 		newCfg.Retry.MaxRetries,
 		newCfg.Retry.RetryOnStatus,
 		newCfg.Retry.BackoffDuration(),
+		pool,
 	)
 
 	newSnap := &ServerSnapshot{
@@ -299,6 +301,11 @@ func (s *LoadBalancerServer) switchAdminServer(newAddr string) {
 	mux.HandleFunc("/api/backends/drain", s.handleBackendDrain)
 	mux.HandleFunc("/api/backends/restore", s.handleBackendRestore)
 	mux.HandleFunc("/api/overview", s.handleOverview)
+	mux.HandleFunc("/api/rate_limit/global", s.handleSetGlobalRateLimit)
+	mux.HandleFunc("/api/rate_limit/backend", s.handleSetBackendRateLimit)
+	mux.HandleFunc("/api/circuit/open", s.handleCircuitOpen)
+	mux.HandleFunc("/api/circuit/close", s.handleCircuitClose)
+	mux.HandleFunc("/api/circuit/thresholds", s.handleSetCircuitThresholds)
 	mux.HandleFunc("/api/reload", s.handleReload)
 	mux.HandleFunc("/api/config", s.handleConfig)
 
@@ -392,6 +399,11 @@ func (s *LoadBalancerServer) Start() error {
 	adminMux.HandleFunc("/api/backends/drain", s.handleBackendDrain)
 	adminMux.HandleFunc("/api/backends/restore", s.handleBackendRestore)
 	adminMux.HandleFunc("/api/overview", s.handleOverview)
+	adminMux.HandleFunc("/api/rate_limit/global", s.handleSetGlobalRateLimit)
+	adminMux.HandleFunc("/api/rate_limit/backend", s.handleSetBackendRateLimit)
+	adminMux.HandleFunc("/api/circuit/open", s.handleCircuitOpen)
+	adminMux.HandleFunc("/api/circuit/close", s.handleCircuitClose)
+	adminMux.HandleFunc("/api/circuit/thresholds", s.handleSetCircuitThresholds)
 	adminMux.HandleFunc("/api/reload", s.handleReload)
 	adminMux.HandleFunc("/api/config", s.handleConfig)
 	adminSrv := &http.Server{
@@ -444,24 +456,32 @@ func (s *LoadBalancerServer) handleStatus(w http.ResponseWriter, r *http.Request
 }
 
 type BackendStatusResp struct {
-	Name             string  `json:"name"`
-	URL              string  `json:"url"`
-	Weight           int     `json:"weight"`
-	Status           string  `json:"status"`
-	ActiveConns      int64   `json:"active_conns"`
-	FailCount        int     `json:"fail_count"`
-	SuccessCount     int     `json:"success_count"`
-	LastError        string  `json:"last_error,omitempty"`
-	LastCheck        string  `json:"last_check,omitempty"`
-	Maintenance      bool    `json:"maintenance"`
-	MaintenanceSince string  `json:"maintenance_since,omitempty"`
-	TotalRequests    int64   `json:"total_requests"`
-	TotalSuccesses   int64   `json:"total_successes"`
-	TotalFailures    int64   `json:"total_failures"`
-	AvgLatencyMs     float64 `json:"avg_latency_ms"`
-	ErrorRate        float64 `json:"error_rate"`
-	LastRequestTime  string  `json:"last_request_time,omitempty"`
-	LastRequestError string  `json:"last_request_error,omitempty"`
+	Name               string  `json:"name"`
+	URL                string  `json:"url"`
+	Weight             int     `json:"weight"`
+	Status             string  `json:"status"`
+	ActiveConns        int64   `json:"active_conns"`
+	FailCount          int     `json:"fail_count"`
+	SuccessCount       int     `json:"success_count"`
+	LastError          string  `json:"last_error,omitempty"`
+	LastCheck          string  `json:"last_check,omitempty"`
+	Maintenance        bool    `json:"maintenance"`
+	MaintenanceSince   string  `json:"maintenance_since,omitempty"`
+	TotalRequests      int64   `json:"total_requests"`
+	TotalSuccesses     int64   `json:"total_successes"`
+	TotalFailures      int64   `json:"total_failures"`
+	AvgLatencyMs       float64 `json:"avg_latency_ms"`
+	ErrorRate          float64 `json:"error_rate"`
+	LastRequestTime    string  `json:"last_request_time,omitempty"`
+	LastRequestError   string  `json:"last_request_error,omitempty"`
+	TotalRateLimited   int64   `json:"total_rate_limited"`
+	CircuitStatus    string  `json:"circuit_status"`
+	CircuitReason  string  `json:"circuit_reason,omitempty"`
+	CircuitRemainingSec int  `json:"circuit_remaining_sec,omitempty"`
+	RateLimitEnabled  bool    `json:"rate_limit_enabled"`
+	RateLimitCapacity int64 `json:"rate_limit_capacity,omitempty"`
+	RateLimitRefill   int64 `json:"rate_limit_refill,omitempty"`
+	RateLimitInterval string `json:"rate_limit_interval,omitempty"`
 }
 
 func (s *LoadBalancerServer) handleBackends(w http.ResponseWriter, r *http.Request) {
@@ -499,25 +519,48 @@ func (s *LoadBalancerServer) handleBackends(w http.ResponseWriter, r *http.Reque
 
 		stats := b.Stats()
 
+		cs, creason, cremaining, _ := b.CircuitInfo()
+		circuitStatusStr := "closed"
+		switch cs {
+		case backend.CircuitOpen:
+			circuitStatusStr = "open"
+		case backend.CircuitHalfOpen:
+			circuitStatusStr = "half_open"
+		}
+
+		rlCap, rlRefill, rlInterval, rlEnabled := b.RateLimitConfig()
+		rlIntervalStr := ""
+		if rlEnabled {
+			rlIntervalStr = rlInterval.String()
+		}
+
 		resp = append(resp, BackendStatusResp{
-			Name:             b.Name,
-			URL:              b.URL.String(),
-			Weight:           b.Weight,
-			Status:           statusStr,
-			ActiveConns:      b.ActiveConns(),
-			FailCount:        b.FailCount(),
-			SuccessCount:     b.SuccessCount(),
-			LastError:        b.LastError(),
-			LastCheck:        lastCheck,
-			Maintenance:      b.IsMaintenance(),
-			MaintenanceSince: maintSince,
-			TotalRequests:    stats.TotalRequests,
-			TotalSuccesses:   stats.TotalSuccesses,
-			TotalFailures:    stats.TotalFailures,
-			AvgLatencyMs:     b.AvgLatencyMs(),
-			ErrorRate:        b.ErrorRate(),
-			LastRequestTime:  lastReqTime,
-			LastRequestError: b.LastRequestError(),
+			Name:               b.Name,
+			URL:                b.URL.String(),
+			Weight:             b.Weight,
+			Status:             statusStr,
+			ActiveConns:        b.ActiveConns(),
+			FailCount:          b.FailCount(),
+			SuccessCount:       b.SuccessCount(),
+			LastError:          b.LastError(),
+			LastCheck:          lastCheck,
+			Maintenance:        b.IsMaintenance(),
+			MaintenanceSince:   maintSince,
+			TotalRequests:      stats.TotalRequests,
+			TotalSuccesses:     stats.TotalSuccesses,
+			TotalFailures:      stats.TotalFailures,
+			AvgLatencyMs:       b.AvgLatencyMs(),
+			ErrorRate:          b.ErrorRate(),
+			LastRequestTime:    lastReqTime,
+			LastRequestError:   b.LastRequestError(),
+			TotalRateLimited:   stats.TotalRateLimited,
+			CircuitStatus:      circuitStatusStr,
+			CircuitReason:      creason,
+			CircuitRemainingSec: cremaining,
+			RateLimitEnabled:   rlEnabled,
+			RateLimitCapacity:  rlCap,
+			RateLimitRefill:    rlRefill,
+			RateLimitInterval:  rlIntervalStr,
 		})
 	}
 
@@ -555,6 +598,12 @@ func (s *LoadBalancerServer) handleOverview(w http.ResponseWriter, r *http.Reque
 		errorRate = float64(ps.TotalFailures) / float64(ps.TotalRequests)
 	}
 
+	grCap, grRefill, grInterval, grEnabled := snap.Pool.GlobalRateLimitConfig()
+	grIntervalStr := ""
+	if grEnabled {
+		grIntervalStr = grInterval.String()
+	}
+
 	isHealthy := ps.EligibleBackends > 0 && errorRate < 0.5
 
 	resp := map[string]interface{}{
@@ -565,16 +614,24 @@ func (s *LoadBalancerServer) handleOverview(w http.ResponseWriter, r *http.Reque
 		"hc_path":        snap.Config.HealthCheck.Path,
 		"hc_interval":    snap.Config.HealthCheck.Interval,
 		"hc_timeout":     snap.Config.HealthCheck.Timeout,
+		"global_rate_limit": map[string]interface{}{
+			"enabled":  grEnabled,
+			"capacity": grCap,
+			"refill":   grRefill,
+			"interval": grIntervalStr,
+		},
 		"pool": map[string]interface{}{
 			"total_backends":       ps.TotalBackends,
 			"healthy_backends":     ps.HealthyBackends,
 			"eligible_backends":    ps.EligibleBackends,
 			"maintenance_backends": ps.MaintenanceBackends,
 			"unhealthy_backends":   ps.UnhealthyBackends,
+			"circuit_open_backends": ps.CircuitOpenBackends,
 			"total_active_conns":   ps.TotalActiveConns,
 			"total_requests":       ps.TotalRequests,
 			"total_successes":      ps.TotalSuccesses,
 			"total_failures":       ps.TotalFailures,
+			"total_rate_limited":   ps.TotalRateLimited,
 			"avg_latency_ms":       avgLatencyMs,
 			"error_rate":           errorRate,
 		},
@@ -651,6 +708,264 @@ func (s *LoadBalancerServer) handleBackendRestore(w http.ResponseWriter, r *http
 		"name":    name,
 		"message": "Backend " + name + " restored from maintenance mode, will rejoin load balancing",
 	})
+}
+
+func (s *LoadBalancerServer) handleSetGlobalRateLimit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	snap := s.currentSnapshot()
+	if snap == nil {
+		http.Error(w, "not ready", http.StatusServiceUnavailable)
+		return
+	}
+
+	capacity, err := parseIntQuery(r, "capacity", 0)
+	if err != nil {
+		http.Error(w, "invalid capacity: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	refill, err := parseIntQuery(r, "refill", 0)
+	if err != nil {
+		http.Error(w, "invalid refill: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	intervalStr := r.URL.Query().Get("interval")
+	interval := time.Second
+	if intervalStr != "" {
+		interval, err = time.ParseDuration(intervalStr)
+		if err != nil {
+			http.Error(w, "invalid interval: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+
+	if capacity <= 0 {
+		snap.Pool.DisableGlobalRateLimit()
+	} else {
+		snap.Pool.SetGlobalRateLimit(int64(capacity), int64(refill), interval)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"result":   "ok",
+		"scope":    "global",
+		"enabled":  capacity > 0,
+		"capacity": capacity,
+		"refill":   refill,
+		"interval": interval.String(),
+	})
+}
+
+func (s *LoadBalancerServer) handleSetBackendRateLimit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	snap := s.currentSnapshot()
+	if snap == nil {
+		http.Error(w, "not ready", http.StatusServiceUnavailable)
+		return
+	}
+
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		http.Error(w, "missing 'name' query parameter", http.StatusBadRequest)
+		return
+	}
+
+	be := snap.Pool.GetBackend(name)
+	if be == nil {
+		http.Error(w, "backend not found: "+name, http.StatusNotFound)
+		return
+	}
+
+	capacity, err := parseIntQuery(r, "capacity", 0)
+	if err != nil {
+		http.Error(w, "invalid capacity: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	refill, err := parseIntQuery(r, "refill", 0)
+	if err != nil {
+		http.Error(w, "invalid refill: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	intervalStr := r.URL.Query().Get("interval")
+	interval := time.Second
+	if intervalStr != "" {
+		interval, err = time.ParseDuration(intervalStr)
+		if err != nil {
+			http.Error(w, "invalid interval: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+
+	if capacity <= 0 {
+		be.DisableRateLimit()
+	} else {
+		be.SetRateLimit(int64(capacity), int64(refill), interval)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"result":   "ok",
+		"scope":    "backend",
+		"name":     name,
+		"enabled":  capacity > 0,
+		"capacity": capacity,
+		"refill":   refill,
+		"interval": interval.String(),
+	})
+}
+
+func (s *LoadBalancerServer) handleCircuitOpen(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	snap := s.currentSnapshot()
+	if snap == nil {
+		http.Error(w, "not ready", http.StatusServiceUnavailable)
+		return
+	}
+
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		http.Error(w, "missing 'name' query parameter", http.StatusBadRequest)
+		return
+	}
+	reason := r.URL.Query().Get("reason")
+
+	be := snap.Pool.GetBackend(name)
+	if be == nil {
+		http.Error(w, "backend not found: "+name, http.StatusNotFound)
+		return
+	}
+
+	be.SetManualCircuitOpen(true, reason)
+
+	cs, creason, cremaining, _ := be.CircuitInfo()
+	csStr := "closed"
+	switch cs {
+	case backend.CircuitOpen:
+		csStr = "open"
+	case backend.CircuitHalfOpen:
+		csStr = "half_open"
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"result":              "opened",
+		"name":                name,
+		"circuit_status":      csStr,
+		"circuit_reason":      creason,
+		"circuit_remaining_sec": cremaining,
+		"message":             "Backend " + name + " circuit manually opened",
+	})
+}
+
+func (s *LoadBalancerServer) handleCircuitClose(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	snap := s.currentSnapshot()
+	if snap == nil {
+		http.Error(w, "not ready", http.StatusServiceUnavailable)
+		return
+	}
+
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		http.Error(w, "missing 'name' query parameter", http.StatusBadRequest)
+		return
+	}
+
+	be := snap.Pool.GetBackend(name)
+	if be == nil {
+		http.Error(w, "backend not found: "+name, http.StatusNotFound)
+		return
+	}
+
+	be.SetManualCircuitOpen(false, "")
+
+	cs, creason, cremaining, _ := be.CircuitInfo()
+	csStr := "closed"
+	switch cs {
+	case backend.CircuitOpen:
+		csStr = "open"
+	case backend.CircuitHalfOpen:
+		csStr = "half_open"
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"result":              "closed",
+		"name":                name,
+		"circuit_status":      csStr,
+		"circuit_reason":      creason,
+		"circuit_remaining_sec": cremaining,
+		"message":             "Backend " + name + " circuit manually closed",
+	})
+}
+
+func (s *LoadBalancerServer) handleSetCircuitThresholds(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	snap := s.currentSnapshot()
+	if snap == nil {
+		http.Error(w, "not ready", http.StatusServiceUnavailable)
+		return
+	}
+
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		http.Error(w, "missing 'name' query parameter", http.StatusBadRequest)
+		return
+	}
+
+	be := snap.Pool.GetBackend(name)
+	if be == nil {
+		http.Error(w, "backend not found: "+name, http.StatusNotFound)
+		return
+	}
+
+	failThreshold, _ := parseIntQuery(r, "fail_threshold", 0)
+	openSeconds, _ := parseIntQuery(r, "open_seconds", 0)
+	probeSuccess, _ := parseIntQuery(r, "probe_success", 0)
+
+	be.SetCircuitThresholds(failThreshold, openSeconds, probeSuccess)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"result":         "ok",
+		"name":           name,
+		"fail_threshold": failThreshold,
+		"open_seconds":   openSeconds,
+		"probe_success":  probeSuccess,
+		"message":        "Backend " + name + " circuit thresholds updated",
+	})
+}
+
+func parseIntQuery(r *http.Request, key string, defaultValue int) (int, error) {
+	val := r.URL.Query().Get(key)
+	if val == "" {
+		return defaultValue, nil
+	}
+	var result int
+	_, err := fmt.Sscanf(val, "%d", &result)
+	if err != nil {
+		return 0, err
+	}
+	return result, nil
 }
 
 func (s *LoadBalancerServer) handleConfig(w http.ResponseWriter, r *http.Request) {

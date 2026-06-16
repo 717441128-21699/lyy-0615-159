@@ -18,14 +18,16 @@ type ReverseProxy struct {
 	maxRetries    int
 	retryOnStatus []int
 	backoff       time.Duration
+	pool          *backend.BackendPool
 }
 
-func NewReverseProxy(lb balancer.LoadBalancer, maxRetries int, retryOnStatus []int, backoff time.Duration) *ReverseProxy {
+func NewReverseProxy(lb balancer.LoadBalancer, maxRetries int, retryOnStatus []int, backoff time.Duration, pool *backend.BackendPool) *ReverseProxy {
 	return &ReverseProxy{
 		balancer:      lb,
 		maxRetries:    maxRetries,
 		retryOnStatus: retryOnStatus,
 		backoff:       backoff,
+		pool:          pool,
 	}
 }
 
@@ -72,12 +74,7 @@ func (rp *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			r.ContentLength = 0
 		}
 
-		exclude := failedBackends
-		if len(exclude) > 0 && i == attempts-1 {
-			exclude = nil
-		}
-
-		be, err := rp.balancer.Next(r, exclude)
+		be, err := rp.balancer.Next(r, failedBackends)
 		if err != nil {
 			attemptErrs = append(attemptErrs, attemptError{
 				Backend: "balancer",
@@ -85,6 +82,26 @@ func (rp *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			})
 			continue
 		}
+
+		if !rp.pool.TryAcquireGlobalRateLimit() {
+			attemptErrs = append(attemptErrs, attemptError{
+				Backend: "global_rate_limit",
+				Error:   "global rate limit exceeded",
+			})
+			rp.writeRateLimited(w, attemptErrs, "global")
+			return
+		}
+
+		if !be.TryAcquireRateLimit() {
+			attemptErrs = append(attemptErrs, attemptError{
+				Backend: be.Name,
+				Error:   "backend rate limit exceeded",
+			})
+			rp.writeRateLimited(w, attemptErrs, "backend")
+			return
+		}
+
+		be.TryCircuitHalfOpen()
 
 		start := time.Now()
 		resp, fwdErr := rp.forwardRequest(r, be)
@@ -112,6 +129,23 @@ func (rp *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
+		if resp.StatusCode >= 500 && resp.StatusCode < 600 {
+			be.RecordRequestFailure(fmt.Errorf("status %d", resp.StatusCode), latency)
+			failedBackends[be.Name] = true
+			attemptErrs = append(attemptErrs, attemptError{
+				Backend: be.Name,
+				Error:   fmt.Sprintf("status %d", resp.StatusCode),
+			})
+			if lastValidResp != nil {
+				lastValidResp.Body.Close()
+			}
+			lastValidResp = resp
+			if i < attempts-1 {
+				continue
+			}
+			break
+		}
+
 		be.RecordRequestSuccess(latency)
 
 		if lastValidResp != nil {
@@ -123,6 +157,24 @@ func (rp *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if lastValidResp != nil {
 		rp.copyResponse(w, lastValidResp)
+		return
+	}
+
+	hasRateLimitErr := false
+	scope := ""
+	for _, e := range attemptErrs {
+		if e.Backend == "global_rate_limit" {
+			hasRateLimitErr = true
+			scope = "global"
+			break
+		}
+		if e.Error == "backend rate limit exceeded" {
+			hasRateLimitErr = true
+			scope = "backend"
+		}
+	}
+	if hasRateLimitErr {
+		rp.writeRateLimited(w, attemptErrs, scope)
 		return
 	}
 
@@ -148,6 +200,37 @@ func (rp *ReverseProxy) writeServiceUnavailable(w http.ResponseWriter, errs []at
 		"code":     http.StatusServiceUnavailable,
 		"attempts": errs,
 		"message":  strings.Join(msgParts, "; "),
+	}
+	if !wantsJSON {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Write([]byte(strings.Join(msgParts, "\n")))
+		w.Write([]byte("\n"))
+		return
+	}
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func (rp *ReverseProxy) writeRateLimited(w http.ResponseWriter, errs []attemptError, scope string) {
+	msgParts := []string{"Rate Limit Exceeded"}
+	if len(errs) > 0 {
+		for _, e := range errs {
+			msgParts = append(msgParts, fmt.Sprintf("[%s] %s", e.Backend, e.Error))
+		}
+	}
+
+	accept := w.Header().Get("Accept")
+	wantsJSON := strings.Contains(accept, "application/json")
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Retry-After", "1")
+	w.WriteHeader(http.StatusTooManyRequests)
+
+	payload := map[string]interface{}{
+		"error":   "Rate Limit Exceeded",
+		"code":    http.StatusTooManyRequests,
+		"scope":   scope,
+		"attempts": errs,
+		"message": strings.Join(msgParts, "; "),
 	}
 	if !wantsJSON {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
