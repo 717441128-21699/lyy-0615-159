@@ -1,8 +1,11 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -22,6 +25,11 @@ type ServerSnapshot struct {
 	Checker  *backend.HealthChecker
 }
 
+type runningServer struct {
+	server *http.Server
+	addr   string
+}
+
 type LoadBalancerServer struct {
 	configMgr *config.ConfigManager
 
@@ -29,9 +37,15 @@ type LoadBalancerServer struct {
 
 	proxyHandler *atomicProxyHandler
 
-	mu       sync.Mutex
-	stopCh   chan struct{}
-	running  bool
+	mu            sync.Mutex
+	stopCh        chan struct{}
+	running       bool
+
+	proxyServersMu sync.Mutex
+	proxyServers   []*runningServer
+
+	adminServersMu sync.Mutex
+	adminServers   []*runningServer
 }
 
 type atomicProxyHandler struct {
@@ -154,12 +168,28 @@ func (s *LoadBalancerServer) onConfigChange(oldCfg, newCfg *config.Config) {
 
 	for _, bc := range newCfg.Backends {
 		if oldB, ok := oldBackendMap[bc.Name]; ok {
-			pool.AddBackend(oldB)
+			if err := oldB.UpdateConfig(
+				bc.URL, bc.Weight,
+				newCfg.HealthCheck.FailureThreshold,
+				newCfg.HealthCheck.SuccessThreshold,
+			); err != nil {
+				fmt.Printf("Error updating backend %s config: %v, creating new one instead\n", bc.Name, err)
+				b, err := backend.NewBackend(
+					bc.Name, bc.URL, bc.Weight,
+					newCfg.HealthCheck.FailureThreshold,
+					newCfg.HealthCheck.SuccessThreshold,
+				)
+				if err != nil {
+					fmt.Printf("Error creating backend %s: %v\n", bc.Name, err)
+					continue
+				}
+				pool.AddBackend(b)
+			} else {
+				pool.AddBackend(oldB)
+			}
 		} else {
 			b, err := backend.NewBackend(
-				bc.Name,
-				bc.URL,
-				bc.Weight,
+				bc.Name, bc.URL, bc.Weight,
 				newCfg.HealthCheck.FailureThreshold,
 				newCfg.HealthCheck.SuccessThreshold,
 			)
@@ -218,7 +248,101 @@ func (s *LoadBalancerServer) onConfigChange(oldCfg, newCfg *config.Config) {
 		}()
 	}
 
+	if oldCfg == nil {
+		oldCfg = &config.Config{}
+	}
+	if oldCfg.Listen != newCfg.Listen {
+		go s.switchProxyServer(newCfg.Listen)
+	}
+	if oldCfg.AdminListen != newCfg.AdminListen {
+		go s.switchAdminServer(newCfg.AdminListen)
+	}
+
 	fmt.Println("Configuration reloaded successfully")
+}
+
+func (s *LoadBalancerServer) switchProxyServer(newAddr string) {
+	fmt.Printf("Switching proxy server to new address: %s\n", newAddr)
+
+	mux := http.NewServeMux()
+	mux.Handle("/", s.proxyHandler)
+	newServer := &http.Server{
+		Addr:    newAddr,
+		Handler: mux,
+	}
+
+	ln, err := net.Listen("tcp", newAddr)
+	if err != nil {
+		fmt.Printf("Failed to switch proxy server: listen %v (keeping old server running)\n", err)
+		return
+	}
+
+	go func() {
+		fmt.Printf("Proxy server starting on new address %s\n", newAddr)
+		if serveErr := newServer.Serve(ln); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			fmt.Printf("New proxy server error: %v\n", serveErr)
+		}
+	}()
+
+	s.proxyServersMu.Lock()
+	oldServers := s.proxyServers
+	s.proxyServers = append(s.proxyServers, &runningServer{server: newServer, addr: newAddr})
+	s.proxyServersMu.Unlock()
+
+	go s.gracefulShutdownOldServers(oldServers, "proxy")
+}
+
+func (s *LoadBalancerServer) switchAdminServer(newAddr string) {
+	fmt.Printf("Switching admin server to new address: %s\n", newAddr)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/api/status", s.handleStatus)
+	mux.HandleFunc("/api/backends", s.handleBackends)
+	mux.HandleFunc("/api/reload", s.handleReload)
+	mux.HandleFunc("/api/config", s.handleConfig)
+
+	newServer := &http.Server{
+		Addr:    newAddr,
+		Handler: mux,
+	}
+
+	ln, err := net.Listen("tcp", newAddr)
+	if err != nil {
+		fmt.Printf("Failed to switch admin server: listen %v (keeping old server running)\n", err)
+		return
+	}
+
+	go func() {
+		fmt.Printf("Admin server starting on new address %s\n", newAddr)
+		if serveErr := newServer.Serve(ln); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			fmt.Printf("New admin server error: %v\n", serveErr)
+		}
+	}()
+
+	s.adminServersMu.Lock()
+	oldServers := s.adminServers
+	s.adminServers = append(s.adminServers, &runningServer{server: newServer, addr: newAddr})
+	s.adminServersMu.Unlock()
+
+	go s.gracefulShutdownOldServers(oldServers, "admin")
+}
+
+func (s *LoadBalancerServer) gracefulShutdownOldServers(oldServers []*runningServer, kind string) {
+	if len(oldServers) == 0 {
+		return
+	}
+	time.Sleep(5 * time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	for _, rs := range oldServers {
+		fmt.Printf("Gracefully shutting down old %s server on %s\n", kind, rs.addr)
+		if err := rs.server.Shutdown(ctx); err != nil {
+			fmt.Printf("Error shutting down old %s server %s: %v\n", kind, rs.addr, err)
+		} else {
+			fmt.Printf("Old %s server on %s shut down gracefully\n", kind, rs.addr)
+		}
+	}
 }
 
 func (s *LoadBalancerServer) currentSnapshot() *ServerSnapshot {
@@ -241,46 +365,54 @@ func (s *LoadBalancerServer) Start() error {
 
 	cfg := s.configMgr.Get()
 
-	go s.startProxyServer(cfg.Listen)
-	go s.startAdminServer(cfg.AdminListen)
+	proxyMux := http.NewServeMux()
+	proxyMux.Handle("/", s.proxyHandler)
+	proxySrv := &http.Server{
+		Addr:    cfg.Listen,
+		Handler: proxyMux,
+	}
+	proxyLn, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		return fmt.Errorf("proxy listen %s: %w", cfg.Listen, err)
+	}
+	s.proxyServersMu.Lock()
+	s.proxyServers = append(s.proxyServers, &runningServer{server: proxySrv, addr: cfg.Listen})
+	s.proxyServersMu.Unlock()
+	go func() {
+		fmt.Printf("Proxy server listening on %s\n", cfg.Listen)
+		if serveErr := proxySrv.Serve(proxyLn); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			fmt.Printf("Proxy server error: %v\n", serveErr)
+		}
+	}()
+
+	adminMux := http.NewServeMux()
+	adminMux.HandleFunc("/health", s.handleHealth)
+	adminMux.HandleFunc("/api/status", s.handleStatus)
+	adminMux.HandleFunc("/api/backends", s.handleBackends)
+	adminMux.HandleFunc("/api/reload", s.handleReload)
+	adminMux.HandleFunc("/api/config", s.handleConfig)
+	adminSrv := &http.Server{
+		Addr:    cfg.AdminListen,
+		Handler: adminMux,
+	}
+	adminLn, err := net.Listen("tcp", cfg.AdminListen)
+	if err != nil {
+		proxySrv.Close()
+		return fmt.Errorf("admin listen %s: %w", cfg.AdminListen, err)
+	}
+	s.adminServersMu.Lock()
+	s.adminServers = append(s.adminServers, &runningServer{server: adminSrv, addr: cfg.AdminListen})
+	s.adminServersMu.Unlock()
+	go func() {
+		fmt.Printf("Admin server listening on %s\n", cfg.AdminListen)
+		if serveErr := adminSrv.Serve(adminLn); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			fmt.Printf("Admin server error: %v\n", serveErr)
+		}
+	}()
+
 	go s.configMgr.Watch(2 * time.Second)
 
-	fmt.Printf("Proxy server listening on %s\n", cfg.Listen)
-	fmt.Printf("Admin server listening on %s\n", cfg.AdminListen)
-
 	return nil
-}
-
-func (s *LoadBalancerServer) startProxyServer(addr string) {
-	mux := http.NewServeMux()
-	mux.Handle("/", s.proxyHandler)
-
-	server := &http.Server{
-		Addr:    addr,
-		Handler: mux,
-	}
-
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		fmt.Printf("Proxy server error: %v\n", err)
-	}
-}
-
-func (s *LoadBalancerServer) startAdminServer(addr string) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", s.handleHealth)
-	mux.HandleFunc("/api/status", s.handleStatus)
-	mux.HandleFunc("/api/backends", s.handleBackends)
-	mux.HandleFunc("/api/reload", s.handleReload)
-	mux.HandleFunc("/api/config", s.handleConfig)
-
-	server := &http.Server{
-		Addr:    addr,
-		Handler: mux,
-	}
-
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		fmt.Printf("Admin server error: %v\n", err)
-	}
 }
 
 func (s *LoadBalancerServer) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -297,6 +429,8 @@ func (s *LoadBalancerServer) handleStatus(w http.ResponseWriter, r *http.Request
 
 	status := map[string]interface{}{
 		"config_version":   s.configMgr.Version(),
+		"listen":         snap.Config.Listen,
+		"admin_listen":   snap.Config.AdminListen,
 		"strategy":         snap.Config.LoadBalancing.Strategy,
 		"total_backends":   len(snap.Pool.Backends()),
 		"healthy_backends": len(snap.Pool.HealthyBackends()),
@@ -396,5 +530,24 @@ func (s *LoadBalancerServer) Stop() {
 	snap := s.currentSnapshot()
 	if snap != nil && snap.Checker != nil {
 		snap.Checker.Stop()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	s.proxyServersMu.Lock()
+	proxySrvs := s.proxyServers
+	s.proxyServers = nil
+	s.proxyServersMu.Unlock()
+	for _, rs := range proxySrvs {
+		rs.server.Shutdown(ctx)
+	}
+
+	s.adminServersMu.Lock()
+	adminSrvs := s.adminServers
+	s.adminServers = nil
+	s.adminServersMu.Unlock()
+	for _, rs := range adminSrvs {
+		rs.server.Shutdown(ctx)
 	}
 }

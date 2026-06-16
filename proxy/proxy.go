@@ -2,10 +2,11 @@ package proxy
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httputil"
+	"strings"
 	"time"
 
 	"loadbalancer/balancer"
@@ -28,66 +29,119 @@ func NewReverseProxy(lb balancer.LoadBalancer, maxRetries int, retryOnStatus []i
 	}
 }
 
-func (rp *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	var lastErr error
-	var lastResp *http.Response
-	attempts := rp.maxRetries + 1
+type attemptError struct {
+	Backend string `json:"backend"`
+	Error   string `json:"error"`
+}
 
+func (rp *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	var bodyBytes []byte
 	if r.Body != nil {
-		bodyBytes, err := io.ReadAll(r.Body)
+		b, err := io.ReadAll(r.Body)
 		if err != nil {
 			http.Error(w, "failed to read request body", http.StatusInternalServerError)
 			return
 		}
 		r.Body.Close()
-		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		bodyBytes = b
 	}
+
+	var (
+		lastValidResp *http.Response
+		attemptErrs   []attemptError
+		attempts      = rp.maxRetries + 1
+	)
+
+	defer func() {
+		if lastValidResp != nil {
+			lastValidResp.Body.Close()
+		}
+	}()
 
 	for i := 0; i < attempts; i++ {
 		if i > 0 {
 			time.Sleep(rp.backoff * time.Duration(i))
-			if r.Body != nil {
-				bodyBytes, _ := io.ReadAll(r.Body)
-				r.Body.Close()
-				r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-			}
 		}
 
-		backend, err := rp.balancer.Next(r)
+		if bodyBytes != nil {
+			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			r.ContentLength = int64(len(bodyBytes))
+		} else {
+			r.Body = http.NoBody
+			r.ContentLength = 0
+		}
+
+		be, err := rp.balancer.Next(r)
 		if err != nil {
-			lastErr = err
+			attemptErrs = append(attemptErrs, attemptError{
+				Backend: "balancer",
+				Error:   err.Error(),
+			})
 			continue
 		}
 
-		resp, err := rp.forwardRequest(r, backend)
+		resp, err := rp.forwardRequest(r, be)
 		if err != nil {
-			lastErr = err
-			backend.RecordFailure(err)
+			be.RecordFailure(err)
+			attemptErrs = append(attemptErrs, attemptError{
+				Backend: be.Name,
+				Error:   err.Error(),
+			})
 			continue
 		}
 
 		if rp.shouldRetry(resp.StatusCode) && i < attempts-1 {
+			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
-			lastResp = resp
+			attemptErrs = append(attemptErrs, attemptError{
+				Backend: be.Name,
+				Error:   fmt.Sprintf("status %d (retried)", resp.StatusCode),
+			})
 			continue
 		}
 
-		rp.copyResponse(w, resp)
-		resp.Body.Close()
+		if lastValidResp != nil {
+			lastValidResp.Body.Close()
+		}
+		lastValidResp = resp
+		break
+	}
+
+	if lastValidResp != nil {
+		rp.copyResponse(w, lastValidResp)
 		return
 	}
 
-	if lastResp != nil {
-		rp.copyResponse(w, lastResp)
-		lastResp.Body.Close()
-		return
+	rp.writeServiceUnavailable(w, attemptErrs)
+}
+
+func (rp *ReverseProxy) writeServiceUnavailable(w http.ResponseWriter, errs []attemptError) {
+	msgParts := []string{"Service Unavailable"}
+	if len(errs) > 0 {
+		for _, e := range errs {
+			msgParts = append(msgParts, fmt.Sprintf("[%s] %s", e.Backend, e.Error))
+		}
 	}
 
-	if lastErr != nil {
-		http.Error(w, fmt.Sprintf("Service Unavailable: %v", lastErr), http.StatusServiceUnavailable)
-	} else {
-		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+	accept := w.Header().Get("Accept")
+	wantsJSON := strings.Contains(accept, "application/json")
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusServiceUnavailable)
+
+	payload := map[string]interface{}{
+		"error":    "Service Unavailable",
+		"code":     http.StatusServiceUnavailable,
+		"attempts": errs,
+		"message":  strings.Join(msgParts, "; "),
 	}
+	if !wantsJSON {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Write([]byte(strings.Join(msgParts, "\n")))
+		w.Write([]byte("\n"))
+		return
+	}
+	_ = json.NewEncoder(w).Encode(payload)
 }
 
 func (rp *ReverseProxy) forwardRequest(r *http.Request, b *backend.Backend) (*http.Response, error) {
@@ -98,14 +152,47 @@ func (rp *ReverseProxy) forwardRequest(r *http.Request, b *backend.Backend) (*ht
 	targetURL.Path = r.URL.Path
 	targetURL.RawPath = r.URL.RawPath
 	targetURL.RawQuery = r.URL.RawQuery
+	targetURL.Opaque = ""
+	targetURL.ForceQuery = false
 
-	outReq := r.Clone(r.Context())
-	outReq.URL = &targetURL
-	outReq.Host = b.URL.Host
-	outReq.Header = make(http.Header)
+	outReq := &http.Request{
+		Method:        r.Method,
+		URL:           &targetURL,
+		Header:        make(http.Header),
+		Body:          r.Body,
+		ContentLength: r.ContentLength,
+		Host:          b.URL.Host,
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Close:         false,
+	}
+	if r.Trailer != nil {
+		outReq.Trailer = make(http.Header)
+		for k, v := range r.Trailer {
+			outReq.Trailer[k] = v
+		}
+	}
+	if len(r.TransferEncoding) > 0 {
+		outReq.TransferEncoding = make([]string, len(r.TransferEncoding))
+		copy(outReq.TransferEncoding, r.TransferEncoding)
+	}
+	if r.Form != nil {
+		outReq.Form = r.Form
+	}
+	if r.PostForm != nil {
+		outReq.PostForm = r.PostForm
+	}
+	if r.MultipartForm != nil {
+		outReq.MultipartForm = r.MultipartForm
+	}
+
 	for k, v := range r.Header {
 		outReq.Header[k] = v
 	}
+	outReq.Header.Del("Te")
+	outReq.Header.Del("Trailer")
+	outReq.Header.Del("Upgrade")
 
 	if clientIP := getRealIP(r); clientIP != "" {
 		if existing := outReq.Header.Get("X-Forwarded-For"); existing != "" {
@@ -113,6 +200,10 @@ func (rp *ReverseProxy) forwardRequest(r *http.Request, b *backend.Backend) (*ht
 		} else {
 			outReq.Header.Set("X-Forwarded-For", clientIP)
 		}
+	}
+	outReq.Header.Set("X-Forwarded-Proto", schemeOf(r))
+	if r.Host != "" {
+		outReq.Header.Set("X-Forwarded-Host", r.Host)
 	}
 
 	client := &http.Client{
@@ -129,6 +220,16 @@ func (rp *ReverseProxy) forwardRequest(r *http.Request, b *backend.Backend) (*ht
 	return client.Do(outReq)
 }
 
+func schemeOf(r *http.Request) string {
+	if r.TLS != nil {
+		return "https"
+	}
+	if s := r.Header.Get("X-Forwarded-Proto"); s != "" {
+		return s
+	}
+	return "http"
+}
+
 func (rp *ReverseProxy) shouldRetry(statusCode int) bool {
 	for _, code := range rp.retryOnStatus {
 		if statusCode == code {
@@ -139,16 +240,43 @@ func (rp *ReverseProxy) shouldRetry(statusCode int) bool {
 }
 
 func (rp *ReverseProxy) copyResponse(w http.ResponseWriter, resp *http.Response) {
+	dst := w.Header()
 	for k, v := range resp.Header {
-		w.Header()[k] = v
+		dst[k] = v
 	}
+	dst.Del("Content-Length")
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	buf := make([]byte, 32*1024)
+	var written int64
+	for {
+		nr, er := resp.Body.Read(buf)
+		if nr > 0 {
+			nw, ew := w.Write(buf[0:nr])
+			if nw > 0 {
+				written += int64(nw)
+			}
+			if ew != nil {
+				return
+			}
+			if nr != nw {
+				return
+			}
+		}
+		if er != nil {
+			if er == io.EOF {
+				return
+			}
+			return
+		}
+	}
 }
 
 func getRealIP(r *http.Request) string {
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		return xff
+		parts := strings.Split(xff, ",")
+		if len(parts) > 0 {
+			return strings.TrimSpace(parts[0])
+		}
 	}
 	if xri := r.Header.Get("X-Real-IP"); xri != "" {
 		return xri
@@ -168,25 +296,3 @@ func splitHostPort(addr string) (string, string, error) {
 	}
 	return "", "", fmt.Errorf("invalid address: %s", addr)
 }
-
-type ProxyManager struct {
-	rp *ReverseProxy
-}
-
-func NewProxyManager() *ProxyManager {
-	return &ProxyManager{}
-}
-
-func (pm *ProxyManager) SetProxy(rp *ReverseProxy) {
-	pm.rp = rp
-}
-
-func (pm *ProxyManager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if pm.rp == nil {
-		http.Error(w, "proxy not initialized", http.StatusInternalServerError)
-		return
-	}
-	pm.rp.ServeHTTP(w, r)
-}
-
-var _ = httputil.ReverseProxy{}

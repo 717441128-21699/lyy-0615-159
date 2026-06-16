@@ -134,6 +134,48 @@ func (b *Backend) SetUnhealthy(err error) {
 	b.successCount = 0
 }
 
+func (b *Backend) UpdateConfig(rawURL string, weight, failureThreshold, successThreshold int) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("parse backend URL: %w", err)
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	oldURL := b.URL.String()
+	oldWeight := b.Weight
+	oldFT := b.failureThreshold
+	oldST := b.successThreshold
+
+	b.URL = u
+	b.Weight = weight
+	b.failureThreshold = failureThreshold
+	b.successThreshold = successThreshold
+
+	changed := false
+	if oldURL != rawURL {
+		fmt.Printf("Backend %s URL updated: %s -> %s\n", b.Name, oldURL, rawURL)
+		changed = true
+	}
+	if oldWeight != weight {
+		fmt.Printf("Backend %s weight updated: %d -> %d\n", b.Name, oldWeight, weight)
+		changed = true
+	}
+	if oldFT != failureThreshold {
+		fmt.Printf("Backend %s failure_threshold updated: %d -> %d\n", b.Name, oldFT, failureThreshold)
+		changed = true
+	}
+	if oldST != successThreshold {
+		fmt.Printf("Backend %s success_threshold updated: %d -> %d\n", b.Name, oldST, successThreshold)
+		changed = true
+	}
+	if !changed {
+		fmt.Printf("Backend %s config unchanged\n", b.Name)
+	}
+	return nil
+}
+
 type HealthChecker struct {
 	backends  []*Backend
 	path      string
