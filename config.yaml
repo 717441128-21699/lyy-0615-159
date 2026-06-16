@@ -1,0 +1,29 @@
+listen: ":8080"
+admin_listen: ":8081"
+
+health_check:
+  interval: "5s"
+  timeout: "2s"
+  path: "/health"
+  failure_threshold: 3
+  success_threshold: 2
+
+retry:
+  max_retries: 2
+  retry_on_status: [500, 502, 503, 504]
+  backoff: "100ms"
+
+load_balancing:
+  strategy: "round_robin"
+  hash_header: "X-Session-Id"
+
+backends:
+  - name: "backend-1"
+    url: "http://127.0.0.1:9001"
+    weight: 1
+  - name: "backend-2"
+    url: "http://127.0.0.1:9002"
+    weight: 2
+  - name: "backend-3"
+    url: "http://127.0.0.1:9003"
+    weight: 1
