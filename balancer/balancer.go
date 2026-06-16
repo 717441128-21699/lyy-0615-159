@@ -13,18 +13,18 @@ import (
 const virtualNodes = 150
 
 type LoadBalancer interface {
-	Next(req *http.Request) (*backend.Backend, error)
+	Next(req *http.Request, exclude map[string]bool) (*backend.Backend, error)
 	Name() string
 }
 
 type RoundRobin struct {
-	mu       sync.Mutex
-	backends []*backend.Backend
-	current  int
-	weights  []int
+	mu        sync.Mutex
+	backends  []*backend.Backend
+	current   int
+	weights   []int
 	maxWeight int
 	gcdWeight int
-	position int
+	position  int
 }
 
 func NewRoundRobin(backends []*backend.Backend) *RoundRobin {
@@ -47,7 +47,7 @@ func (rr *RoundRobin) Name() string {
 	return "round_robin"
 }
 
-func (rr *RoundRobin) Next(req *http.Request) (*backend.Backend, error) {
+func (rr *RoundRobin) Next(req *http.Request, exclude map[string]bool) (*backend.Backend, error) {
 	rr.mu.Lock()
 	defer rr.mu.Unlock()
 
@@ -67,13 +67,26 @@ func (rr *RoundRobin) Next(req *http.Request) (*backend.Backend, error) {
 				}
 			}
 		}
-		if rr.weights[rr.position] >= rr.current && rr.backends[rr.position].IsHealthy() {
-			return rr.backends[rr.position], nil
+		b := rr.backends[rr.position]
+		if _, excluded := exclude[b.Name]; excluded {
+			continue
+		}
+		if rr.weights[rr.position] >= rr.current && b.IsEligible() {
+			return b, nil
 		}
 	}
 
 	for _, b := range rr.backends {
-		if b.IsHealthy() {
+		if excluded := exclude[b.Name]; excluded {
+			continue
+		}
+		if b.IsEligible() {
+			return b, nil
+		}
+	}
+
+	for _, b := range rr.backends {
+		if b.IsEligible() {
 			return b, nil
 		}
 	}
@@ -93,7 +106,7 @@ func (lc *LeastConn) Name() string {
 	return "least_conn"
 }
 
-func (lc *LeastConn) Next(req *http.Request) (*backend.Backend, error) {
+func (lc *LeastConn) Next(req *http.Request, exclude map[string]bool) (*backend.Backend, error) {
 	lc.mu.RLock()
 	defer lc.mu.RUnlock()
 
@@ -101,7 +114,10 @@ func (lc *LeastConn) Next(req *http.Request) (*backend.Backend, error) {
 	var least int64 = -1
 
 	for _, b := range lc.backends {
-		if !b.IsHealthy() {
+		if excluded := exclude[b.Name]; excluded {
+			continue
+		}
+		if !b.IsEligible() {
 			continue
 		}
 		conns := b.ActiveConns()
@@ -113,16 +129,21 @@ func (lc *LeastConn) Next(req *http.Request) (*backend.Backend, error) {
 	}
 
 	if best == nil {
+		for _, b := range lc.backends {
+			if b.IsEligible() {
+				return b, nil
+			}
+		}
 		return nil, ErrNoHealthyBackends
 	}
 	return best, nil
 }
 
 type ConsistentHash struct {
-	mu       sync.RWMutex
-	backends []*backend.Backend
-	ring     []uint32
-	hashMap  map[uint32]*backend.Backend
+	mu         sync.RWMutex
+	backends   []*backend.Backend
+	ring       []uint32
+	hashMap    map[uint32]*backend.Backend
 	hashHeader string
 }
 
@@ -158,7 +179,7 @@ func (ch *ConsistentHash) buildRing() {
 	})
 }
 
-func (ch *ConsistentHash) Next(req *http.Request) (*backend.Backend, error) {
+func (ch *ConsistentHash) Next(req *http.Request, exclude map[string]bool) (*backend.Backend, error) {
 	ch.mu.RLock()
 	defer ch.mu.RUnlock()
 
@@ -181,7 +202,7 @@ func (ch *ConsistentHash) Next(req *http.Request) (*backend.Backend, error) {
 	for {
 		nodeHash := ch.ring[idx]
 		b := ch.hashMap[nodeHash]
-		if b.IsHealthy() {
+		if excluded := exclude[b.Name]; !excluded && b.IsEligible() {
 			return b, nil
 		}
 
@@ -192,7 +213,13 @@ func (ch *ConsistentHash) Next(req *http.Request) (*backend.Backend, error) {
 	}
 
 	for _, b := range ch.backends {
-		if b.IsHealthy() {
+		if excluded := exclude[b.Name]; !excluded && b.IsEligible() {
+			return b, nil
+		}
+	}
+
+	for _, b := range ch.backends {
+		if b.IsEligible() {
 			return b, nil
 		}
 	}

@@ -241,11 +241,8 @@ func (s *LoadBalancerServer) onConfigChange(oldCfg, newCfg *config.Config) {
 	checker.Start()
 
 	if oldSnap != nil && oldSnap.Checker != nil {
-		go func() {
-			time.Sleep(30 * time.Second)
-			oldSnap.Checker.Stop()
-			fmt.Println("Old health checker stopped after graceful period")
-		}()
+		oldSnap.Checker.Stop()
+		fmt.Println("Old health checker stopped immediately (config reloaded)")
 	}
 
 	if oldCfg == nil {
@@ -299,6 +296,9 @@ func (s *LoadBalancerServer) switchAdminServer(newAddr string) {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/backends", s.handleBackends)
+	mux.HandleFunc("/api/backends/drain", s.handleBackendDrain)
+	mux.HandleFunc("/api/backends/restore", s.handleBackendRestore)
+	mux.HandleFunc("/api/overview", s.handleOverview)
 	mux.HandleFunc("/api/reload", s.handleReload)
 	mux.HandleFunc("/api/config", s.handleConfig)
 
@@ -389,6 +389,9 @@ func (s *LoadBalancerServer) Start() error {
 	adminMux.HandleFunc("/health", s.handleHealth)
 	adminMux.HandleFunc("/api/status", s.handleStatus)
 	adminMux.HandleFunc("/api/backends", s.handleBackends)
+	adminMux.HandleFunc("/api/backends/drain", s.handleBackendDrain)
+	adminMux.HandleFunc("/api/backends/restore", s.handleBackendRestore)
+	adminMux.HandleFunc("/api/overview", s.handleOverview)
 	adminMux.HandleFunc("/api/reload", s.handleReload)
 	adminMux.HandleFunc("/api/config", s.handleConfig)
 	adminSrv := &http.Server{
@@ -441,15 +444,24 @@ func (s *LoadBalancerServer) handleStatus(w http.ResponseWriter, r *http.Request
 }
 
 type BackendStatusResp struct {
-	Name        string `json:"name"`
-	URL         string `json:"url"`
-	Weight      int    `json:"weight"`
-	Status      string `json:"status"`
-	ActiveConns int64  `json:"active_conns"`
-	FailCount   int    `json:"fail_count"`
-	SuccessCount int   `json:"success_count"`
-	LastError   string `json:"last_error,omitempty"`
-	LastCheck   string `json:"last_check,omitempty"`
+	Name             string  `json:"name"`
+	URL              string  `json:"url"`
+	Weight           int     `json:"weight"`
+	Status           string  `json:"status"`
+	ActiveConns      int64   `json:"active_conns"`
+	FailCount        int     `json:"fail_count"`
+	SuccessCount     int     `json:"success_count"`
+	LastError        string  `json:"last_error,omitempty"`
+	LastCheck        string  `json:"last_check,omitempty"`
+	Maintenance      bool    `json:"maintenance"`
+	MaintenanceSince string  `json:"maintenance_since,omitempty"`
+	TotalRequests    int64   `json:"total_requests"`
+	TotalSuccesses   int64   `json:"total_successes"`
+	TotalFailures    int64   `json:"total_failures"`
+	AvgLatencyMs     float64 `json:"avg_latency_ms"`
+	ErrorRate        float64 `json:"error_rate"`
+	LastRequestTime  string  `json:"last_request_time,omitempty"`
+	LastRequestError string  `json:"last_request_error,omitempty"`
 }
 
 func (s *LoadBalancerServer) handleBackends(w http.ResponseWriter, r *http.Request) {
@@ -475,16 +487,37 @@ func (s *LoadBalancerServer) handleBackends(w http.ResponseWriter, r *http.Reque
 			lastCheck = b.LastCheck().Format(time.RFC3339)
 		}
 
+		maintSince := ""
+		if !b.MaintenanceSince().IsZero() {
+			maintSince = b.MaintenanceSince().Format(time.RFC3339)
+		}
+
+		lastReqTime := ""
+		if !b.LastRequestTime().IsZero() {
+			lastReqTime = b.LastRequestTime().Format(time.RFC3339)
+		}
+
+		stats := b.Stats()
+
 		resp = append(resp, BackendStatusResp{
-			Name:         b.Name,
-			URL:          b.URL.String(),
-			Weight:       b.Weight,
-			Status:       statusStr,
-			ActiveConns:  b.ActiveConns(),
-			FailCount:    b.FailCount(),
-			SuccessCount: b.SuccessCount(),
-			LastError:    b.LastError(),
-			LastCheck:    lastCheck,
+			Name:             b.Name,
+			URL:              b.URL.String(),
+			Weight:           b.Weight,
+			Status:           statusStr,
+			ActiveConns:      b.ActiveConns(),
+			FailCount:        b.FailCount(),
+			SuccessCount:     b.SuccessCount(),
+			LastError:        b.LastError(),
+			LastCheck:        lastCheck,
+			Maintenance:      b.IsMaintenance(),
+			MaintenanceSince: maintSince,
+			TotalRequests:    stats.TotalRequests,
+			TotalSuccesses:   stats.TotalSuccesses,
+			TotalFailures:    stats.TotalFailures,
+			AvgLatencyMs:     b.AvgLatencyMs(),
+			ErrorRate:        b.ErrorRate(),
+			LastRequestTime:  lastReqTime,
+			LastRequestError: b.LastRequestError(),
 		})
 	}
 
@@ -505,6 +538,119 @@ func (s *LoadBalancerServer) handleReload(w http.ResponseWriter, r *http.Request
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("config reloaded"))
+}
+
+func (s *LoadBalancerServer) handleOverview(w http.ResponseWriter, r *http.Request) {
+	snap := s.currentSnapshot()
+	if snap == nil {
+		http.Error(w, "not ready", http.StatusServiceUnavailable)
+		return
+	}
+
+	ps := snap.Pool.PoolStats()
+	avgLatencyMs := 0.0
+	errorRate := 0.0
+	if ps.TotalRequests > 0 {
+		avgLatencyMs = float64(ps.TotalLatencyNs) / float64(ps.TotalRequests) / 1e6
+		errorRate = float64(ps.TotalFailures) / float64(ps.TotalRequests)
+	}
+
+	isHealthy := ps.EligibleBackends > 0 && errorRate < 0.5
+
+	resp := map[string]interface{}{
+		"config_version": s.configMgr.Version(),
+		"listen":         snap.Config.Listen,
+		"admin_listen":   snap.Config.AdminListen,
+		"strategy":       snap.Config.LoadBalancing.Strategy,
+		"hc_path":        snap.Config.HealthCheck.Path,
+		"hc_interval":    snap.Config.HealthCheck.Interval,
+		"hc_timeout":     snap.Config.HealthCheck.Timeout,
+		"pool": map[string]interface{}{
+			"total_backends":       ps.TotalBackends,
+			"healthy_backends":     ps.HealthyBackends,
+			"eligible_backends":    ps.EligibleBackends,
+			"maintenance_backends": ps.MaintenanceBackends,
+			"unhealthy_backends":   ps.UnhealthyBackends,
+			"total_active_conns":   ps.TotalActiveConns,
+			"total_requests":       ps.TotalRequests,
+			"total_successes":      ps.TotalSuccesses,
+			"total_failures":       ps.TotalFailures,
+			"avg_latency_ms":       avgLatencyMs,
+			"error_rate":           errorRate,
+		},
+		"is_healthy": isHealthy,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func (s *LoadBalancerServer) handleBackendDrain(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		http.Error(w, "missing 'name' query parameter", http.StatusBadRequest)
+		return
+	}
+
+	snap := s.currentSnapshot()
+	if snap == nil {
+		http.Error(w, "not ready", http.StatusServiceUnavailable)
+		return
+	}
+
+	be := snap.Pool.GetBackend(name)
+	if be == nil {
+		http.Error(w, "backend not found: "+name, http.StatusNotFound)
+		return
+	}
+
+	be.SetMaintenance(true)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"result":  "drained",
+		"name":    name,
+		"message": "Backend " + name + " placed into maintenance mode (drained), new requests will not be routed to it",
+	})
+}
+
+func (s *LoadBalancerServer) handleBackendRestore(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		http.Error(w, "missing 'name' query parameter", http.StatusBadRequest)
+		return
+	}
+
+	snap := s.currentSnapshot()
+	if snap == nil {
+		http.Error(w, "not ready", http.StatusServiceUnavailable)
+		return
+	}
+
+	be := snap.Pool.GetBackend(name)
+	if be == nil {
+		http.Error(w, "backend not found: "+name, http.StatusNotFound)
+		return
+	}
+
+	be.SetMaintenance(false)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"result":  "restored",
+		"name":    name,
+		"message": "Backend " + name + " restored from maintenance mode, will rejoin load balancing",
+	})
 }
 
 func (s *LoadBalancerServer) handleConfig(w http.ResponseWriter, r *http.Request) {

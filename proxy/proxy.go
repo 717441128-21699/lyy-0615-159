@@ -50,6 +50,7 @@ func (rp *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		lastValidResp *http.Response
 		attemptErrs   []attemptError
 		attempts      = rp.maxRetries + 1
+		failedBackends = make(map[string]bool)
 	)
 
 	defer func() {
@@ -71,7 +72,12 @@ func (rp *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			r.ContentLength = 0
 		}
 
-		be, err := rp.balancer.Next(r)
+		exclude := failedBackends
+		if len(exclude) > 0 && i == attempts-1 {
+			exclude = nil
+		}
+
+		be, err := rp.balancer.Next(r, exclude)
 		if err != nil {
 			attemptErrs = append(attemptErrs, attemptError{
 				Backend: "balancer",
@@ -80,25 +86,33 @@ func (rp *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		resp, err := rp.forwardRequest(r, be)
-		if err != nil {
-			be.RecordFailure(err)
+		start := time.Now()
+		resp, fwdErr := rp.forwardRequest(r, be)
+		latency := time.Since(start)
+
+		if fwdErr != nil {
+			be.RecordRequestFailure(fwdErr, latency)
+			failedBackends[be.Name] = true
 			attemptErrs = append(attemptErrs, attemptError{
 				Backend: be.Name,
-				Error:   err.Error(),
+				Error:   fwdErr.Error(),
 			})
 			continue
 		}
 
 		if rp.shouldRetry(resp.StatusCode) && i < attempts-1 {
-			io.Copy(io.Discard, resp.Body)
+			_, _ = io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
+			be.RecordRequestFailure(fmt.Errorf("status %d", resp.StatusCode), latency)
+			failedBackends[be.Name] = true
 			attemptErrs = append(attemptErrs, attemptError{
 				Backend: be.Name,
 				Error:   fmt.Sprintf("status %d (retried)", resp.StatusCode),
 			})
 			continue
 		}
+
+		be.RecordRequestSuccess(latency)
 
 		if lastValidResp != nil {
 			lastValidResp.Body.Close()
@@ -193,6 +207,7 @@ func (rp *ReverseProxy) forwardRequest(r *http.Request, b *backend.Backend) (*ht
 	outReq.Header.Del("Te")
 	outReq.Header.Del("Trailer")
 	outReq.Header.Del("Upgrade")
+	outReq.Header.Del("Connection")
 
 	if clientIP := getRealIP(r); clientIP != "" {
 		if existing := outReq.Header.Get("X-Forwarded-For"); existing != "" {
@@ -245,16 +260,13 @@ func (rp *ReverseProxy) copyResponse(w http.ResponseWriter, resp *http.Response)
 		dst[k] = v
 	}
 	dst.Del("Content-Length")
+	dst.Del("Connection")
 	w.WriteHeader(resp.StatusCode)
 	buf := make([]byte, 32*1024)
-	var written int64
 	for {
 		nr, er := resp.Body.Read(buf)
 		if nr > 0 {
 			nw, ew := w.Write(buf[0:nr])
-			if nw > 0 {
-				written += int64(nw)
-			}
 			if ew != nil {
 				return
 			}
@@ -263,9 +275,6 @@ func (rp *ReverseProxy) copyResponse(w http.ResponseWriter, resp *http.Response)
 			}
 		}
 		if er != nil {
-			if er == io.EOF {
-				return
-			}
 			return
 		}
 	}
