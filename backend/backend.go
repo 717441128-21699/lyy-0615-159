@@ -133,6 +133,8 @@ type Backend struct {
 	failureThreshold int
 	successThreshold int
 
+	hcVersion int64
+
 	lastCheck       time.Time
 	lastHCError     string
 
@@ -146,16 +148,22 @@ type Backend struct {
 	totalLatencyNs     int64
 	totalRateLimited   int64
 
-	rateLimiter *RateLimiter
+	rateLimiter        *RateLimiter
+	rateLimitExpiresAt time.Time
 
-	circuitStatus      CircuitStatus
-	circuitOpenSince   time.Time
-	circuitOpenReason  string
-	circuitOpenSeconds int
-	circuitConsecFails int
-	circuitFailThreshold int
-	circuitProbeSuccess int
-	circuitManualOpen  bool
+	circuitStatus            CircuitStatus
+	circuitOpenSince         time.Time
+	circuitOpenReason        string
+	circuitOpenSeconds       int
+	circuitConsecFails       int
+	circuitFailThreshold     int
+	circuitProbeSuccess      int
+	circuitOriginalProbeSucc int
+	circuitHalfOpenPermits   int
+	circuitManualOpen        bool
+	circuitManualExpiresAt   time.Time
+
+	eventBus *EventBus
 }
 
 func NewBackend(name, rawURL string, weight, failureThreshold, successThreshold int) (*Backend, error) {
@@ -174,6 +182,7 @@ func NewBackend(name, rawURL string, weight, failureThreshold, successThreshold 
 		circuitFailThreshold:    5,
 		circuitOpenSeconds:      30,
 		circuitProbeSuccess:     2,
+		circuitOriginalProbeSucc: 2,
 	}, nil
 }
 
@@ -205,18 +214,20 @@ func (b *Backend) CircuitStatus() CircuitStatus {
 	return b.circuitStatus
 }
 
-func (b *Backend) CircuitInfo() (status CircuitStatus, reason string, remainingSec int, openSince time.Time) {
+func (b *Backend) CircuitInfo() (status CircuitStatus, reason string, remainingSec int, openSince time.Time, nextProbeTime time.Time, halfOpenPermits int) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	remaining := 0
+	nextProbe := time.Time{}
 	if b.circuitStatus == CircuitOpen && !b.circuitOpenSince.IsZero() {
 		elapsed := int(time.Since(b.circuitOpenSince).Seconds())
 		remaining = b.circuitOpenSeconds - elapsed
 		if remaining < 0 {
 			remaining = 0
 		}
+		nextProbe = b.circuitOpenSince.Add(time.Duration(b.circuitOpenSeconds) * time.Second)
 	}
-	return b.circuitStatus, b.circuitOpenReason, remaining, b.circuitOpenSince
+	return b.circuitStatus, b.circuitOpenReason, remaining, b.circuitOpenSince, nextProbe, b.circuitHalfOpenPermits
 }
 
 func (b *Backend) SetCircuitThresholds(failThreshold int, openSeconds int, probeSuccess int) {
@@ -230,6 +241,7 @@ func (b *Backend) SetCircuitThresholds(failThreshold int, openSeconds int, probe
 	}
 	if probeSuccess > 0 {
 		b.circuitProbeSuccess = probeSuccess
+		b.circuitOriginalProbeSucc = probeSuccess
 	}
 }
 
@@ -239,13 +251,29 @@ func (b *Backend) RecordCircuitSuccess() {
 	b.circuitConsecFails = 0
 	if b.circuitStatus == CircuitHalfOpen {
 		b.circuitProbeSuccess--
+		b.circuitHalfOpenPermits = minInt(b.circuitHalfOpenPermits*2, 10)
 		if b.circuitProbeSuccess <= 0 {
 			b.circuitStatus = CircuitClosed
 			b.circuitOpenReason = ""
 			b.circuitOpenSince = time.Time{}
+			b.circuitHalfOpenPermits = 0
+			b.circuitProbeSuccess = b.circuitOriginalProbeSucc
 			fmt.Printf("Backend %s circuit CLOSED (probe successes reached threshold)\n", b.Name)
+			if b.eventBus != nil {
+				b.eventBus.Record(b.Name, EventCircuitClosed, "probe successes reached threshold")
+			}
+		} else {
+			fmt.Printf("Backend %s circuit HALF-OPEN probe success, remaining=%d, permits=%d\n",
+				b.Name, b.circuitProbeSuccess, b.circuitHalfOpenPermits)
 		}
 	}
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (b *Backend) RecordCircuitFailure(err error) {
@@ -258,6 +286,9 @@ func (b *Backend) RecordCircuitFailure(err error) {
 		b.circuitOpenReason = fmt.Sprintf("probe failed: %v", err)
 		b.circuitConsecFails = 0
 		fmt.Printf("Backend %s circuit RE-OPENED: probe failed\n", b.Name)
+		if b.eventBus != nil {
+			b.eventBus.Record(b.Name, EventCircuitOpened, fmt.Sprintf("probe failed: %v", err))
+		}
 		return
 	}
 
@@ -272,6 +303,9 @@ func (b *Backend) RecordCircuitFailure(err error) {
 		b.circuitOpenReason = fmt.Sprintf("consecutive failures: %d, last: %v", b.circuitConsecFails, err)
 		b.circuitConsecFails = 0
 		fmt.Printf("Backend %s circuit OPENED: %s\n", b.Name, b.circuitOpenReason)
+		if b.eventBus != nil {
+			b.eventBus.Record(b.Name, EventCircuitOpened, b.circuitOpenReason)
+		}
 	}
 }
 
@@ -279,22 +313,36 @@ func (b *Backend) TryCircuitHalfOpen() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if b.circuitStatus != CircuitOpen || b.circuitManualOpen {
+	if b.circuitManualOpen {
 		return false
 	}
 
-	elapsed := time.Since(b.circuitOpenSince)
-	if elapsed >= time.Duration(b.circuitOpenSeconds)*time.Second {
-		b.circuitStatus = CircuitHalfOpen
-		b.circuitConsecFails = 0
-		b.circuitProbeSuccess = b.circuitProbeSuccess
-		fmt.Printf("Backend %s circuit HALF-OPEN: starting probe\n", b.Name)
-		return true
+	if b.circuitStatus == CircuitHalfOpen {
+		if b.circuitHalfOpenPermits > 0 {
+			b.circuitHalfOpenPermits--
+			return true
+		}
+		return false
+	}
+
+	if b.circuitStatus == CircuitOpen {
+		elapsed := time.Since(b.circuitOpenSince)
+		if elapsed >= time.Duration(b.circuitOpenSeconds)*time.Second {
+			b.circuitStatus = CircuitHalfOpen
+			b.circuitConsecFails = 0
+			b.circuitProbeSuccess = b.circuitOriginalProbeSucc
+			b.circuitHalfOpenPermits = 1
+			fmt.Printf("Backend %s circuit HALF-OPEN: starting probe, permits=1\n", b.Name)
+			if b.eventBus != nil {
+				b.eventBus.Record(b.Name, EventCircuitHalfOpen, "starting probe, permits=1")
+			}
+			return true
+		}
 	}
 	return false
 }
 
-func (b *Backend) SetManualCircuitOpen(open bool, reason string) {
+func (b *Backend) SetManualCircuitOpen(open bool, reason string, ttl time.Duration) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -302,19 +350,43 @@ func (b *Backend) SetManualCircuitOpen(open bool, reason string) {
 		b.circuitManualOpen = true
 		b.circuitStatus = CircuitOpen
 		b.circuitOpenSince = time.Now()
+		if ttl > 0 {
+			b.circuitManualExpiresAt = time.Now().Add(ttl)
+		} else {
+			b.circuitManualExpiresAt = time.Time{}
+		}
 		if reason == "" {
 			reason = "manual operation"
 		}
 		b.circuitOpenReason = fmt.Sprintf("manual: %s", reason)
+		detail := reason
+		if ttl > 0 {
+			detail += fmt.Sprintf(", ttl=%s", ttl)
+		}
 		fmt.Printf("Backend %s circuit manually OPENED: %s\n", b.Name, b.circuitOpenReason)
+		if b.eventBus != nil {
+			b.eventBus.Record(b.Name, EventCircuitManualOpen, detail)
+		}
 	} else {
 		b.circuitManualOpen = false
+		b.circuitManualExpiresAt = time.Time{}
 		b.circuitStatus = CircuitClosed
 		b.circuitOpenReason = ""
 		b.circuitOpenSince = time.Time{}
 		b.circuitConsecFails = 0
+		b.circuitHalfOpenPermits = 0
+		b.circuitProbeSuccess = b.circuitOriginalProbeSucc
 		fmt.Printf("Backend %s circuit manually CLOSED\n", b.Name)
+		if b.eventBus != nil {
+			b.eventBus.Record(b.Name, EventCircuitManualClose, "manual restore")
+		}
 	}
+}
+
+func (b *Backend) CircuitManualExpiresAt() time.Time {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.circuitManualExpiresAt
 }
 
 func (b *Backend) TryAcquireRateLimit() bool {
@@ -323,18 +395,45 @@ func (b *Backend) TryAcquireRateLimit() bool {
 		b.statsMu.Lock()
 		b.totalRateLimited++
 		b.statsMu.Unlock()
+		if b.eventBus != nil {
+			b.eventBus.Record(b.Name, EventRateLimitHit, "backend rate limit exceeded")
+		}
 	}
 	return ok
 }
 
-func (b *Backend) SetRateLimit(capacity int64, refillAmount int64, refillInterval time.Duration) {
+func (b *Backend) SetRateLimit(capacity int64, refillAmount int64, refillInterval time.Duration, ttl time.Duration) {
+	b.mu.Lock()
+	if ttl > 0 {
+		b.rateLimitExpiresAt = time.Now().Add(ttl)
+	} else {
+		b.rateLimitExpiresAt = time.Time{}
+	}
+	b.mu.Unlock()
+
 	b.rateLimiter.SetLimit(capacity, refillAmount, refillInterval)
-	fmt.Printf("Backend %s rate limit set: capacity=%d, refill=%d/%s\n", b.Name, capacity, refillAmount, refillInterval)
+	detail := fmt.Sprintf("capacity=%d, refill=%d/%s", capacity, refillAmount, refillInterval)
+	if ttl > 0 {
+		detail += fmt.Sprintf(", ttl=%s", ttl)
+	}
+	fmt.Printf("Backend %s rate limit set: %s\n", b.Name, detail)
+	if b.eventBus != nil {
+		b.eventBus.Record(b.Name, EventRateLimitSet, detail)
+	}
+}
+
+func (b *Backend) RateLimitExpiresAt() time.Time {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.rateLimitExpiresAt
 }
 
 func (b *Backend) DisableRateLimit() {
 	b.rateLimiter.Disable()
 	fmt.Printf("Backend %s rate limit disabled\n", b.Name)
+	if b.eventBus != nil {
+		b.eventBus.Record(b.Name, EventRateLimitDisabled, "disabled via API")
+	}
 }
 
 func (b *Backend) RateLimitConfig() (capacity int64, refillAmount int64, refillInterval time.Duration, enabled bool) {
@@ -361,10 +460,16 @@ func (b *Backend) SetMaintenance(on bool) {
 		b.maintenance = true
 		b.maintenanceSince = time.Now()
 		fmt.Printf("Backend %s placed into MAINTENANCE mode (drained)\n", b.Name)
+		if b.eventBus != nil {
+			b.eventBus.Record(b.Name, EventMaintenanceOn, "drained via API")
+		}
 	} else if !on && b.maintenance {
 		b.maintenance = false
 		b.maintenanceSince = time.Time{}
 		fmt.Printf("Backend %s restored from MAINTENANCE mode\n", b.Name)
+		if b.eventBus != nil {
+			b.eventBus.Record(b.Name, EventMaintenanceOff, "restored via API")
+		}
 	}
 }
 
@@ -463,9 +568,24 @@ func (b *Backend) ResetStats() {
 	fmt.Printf("Backend %s stats reset\n", b.Name)
 }
 
-func (b *Backend) RecordSuccess() {
+func (b *Backend) SetHCVersion(version int64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.hcVersion = version
+	fmt.Printf("Backend %s HC version set to #%d\n", b.Name, version)
+	if b.eventBus != nil {
+		b.eventBus.Record(b.Name, EventHCVersionUpdated, fmt.Sprintf("version=#%d", version))
+	}
+}
+
+func (b *Backend) RecordSuccess(checkerID int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if checkerID != 0 && checkerID != b.hcVersion {
+		fmt.Printf("Backend %s ignoring old HC result #%d (current #%d)\n", b.Name, checkerID, b.hcVersion)
+		return
+	}
 
 	b.lastCheck = time.Now()
 	b.failCount = 0
@@ -475,12 +595,20 @@ func (b *Backend) RecordSuccess() {
 		b.status = StatusHealthy
 		b.lastHCError = ""
 		fmt.Printf("Backend %s is now healthy (consecutive HC successes: %d)\n", b.Name, b.successCount)
+		if b.eventBus != nil {
+			b.eventBus.Record(b.Name, EventHCHealthy, fmt.Sprintf("consecutive successes=%d", b.successCount))
+		}
 	}
 }
 
-func (b *Backend) RecordFailure(err error) {
+func (b *Backend) RecordFailure(err error, checkerID int64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	if checkerID != 0 && checkerID != b.hcVersion {
+		fmt.Printf("Backend %s ignoring old HC result #%d (current #%d)\n", b.Name, checkerID, b.hcVersion)
+		return
+	}
 
 	b.lastCheck = time.Now()
 	b.lastHCError = err.Error()
@@ -490,6 +618,9 @@ func (b *Backend) RecordFailure(err error) {
 	if b.status != StatusUnhealthy && b.failCount >= b.failureThreshold {
 		b.status = StatusUnhealthy
 		fmt.Printf("Backend %s is now unhealthy (consecutive HC failures: %d): %v\n", b.Name, b.failCount, err)
+		if b.eventBus != nil {
+			b.eventBus.Record(b.Name, EventHCUnhealthy, fmt.Sprintf("consecutive failures=%d, err=%v", b.failCount, err))
+		}
 	}
 }
 
@@ -610,6 +741,10 @@ func NewHealthChecker(path string, interval, timeout time.Duration) *HealthCheck
 	}
 }
 
+func (hc *HealthChecker) ID() int64 {
+	return hc.id
+}
+
 func (hc *HealthChecker) SetBackends(backends []*Backend) {
 	hc.mu.Lock()
 	defer hc.mu.Unlock()
@@ -688,32 +823,131 @@ func (hc *HealthChecker) check(b *Backend) {
 
 	resp, err := hc.client.Get(checkURL)
 	if err != nil {
-		b.RecordFailure(fmt.Errorf("HC #%d failed: %w", hc.id, err))
+		b.RecordFailure(fmt.Errorf("HC #%d failed: %w", hc.id, err), hc.id)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
-		b.RecordSuccess()
+		b.RecordSuccess(hc.id)
 	} else {
-		b.RecordFailure(fmt.Errorf("HC #%d returned status %d", hc.id, resp.StatusCode))
+		b.RecordFailure(fmt.Errorf("HC #%d returned status %d", hc.id, resp.StatusCode), hc.id)
 	}
 }
 
 type BackendPool struct {
-	mu           sync.RWMutex
-	backends     []*Backend
-	checker      *HealthChecker
-	rateLimiter  *RateLimiter
-	statsMu      sync.Mutex
-	totalRateLimited int64
+	mu                      sync.RWMutex
+	backends                []*Backend
+	checker                 *HealthChecker
+	rateLimiter             *RateLimiter
+	globalRateLimitExpiresAt time.Time
+	eventBus                *EventBus
+	reaperStopCh            chan struct{}
+	reaperRunning           bool
+	statsMu                 sync.Mutex
+	totalRateLimited        int64
 }
 
 func NewBackendPool() *BackendPool {
 	return &BackendPool{
 		backends:    make([]*Backend, 0),
 		rateLimiter: NewRateLimiter(0, 0, 0),
+		eventBus:    NewEventBus(1000),
 	}
+}
+
+func (bp *BackendPool) StartReaper() {
+	bp.mu.Lock()
+	if bp.reaperRunning {
+		bp.mu.Unlock()
+		return
+	}
+	bp.reaperRunning = true
+	bp.reaperStopCh = make(chan struct{})
+	stopCh := bp.reaperStopCh
+	bp.mu.Unlock()
+
+	fmt.Println("Backend pool reaper started (checking expired governance actions)")
+
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				bp.checkExpired()
+			case <-stopCh:
+				fmt.Println("Backend pool reaper stopped")
+				return
+			}
+		}
+	}()
+}
+
+func (bp *BackendPool) StopReaper() {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+	if !bp.reaperRunning {
+		return
+	}
+	bp.reaperRunning = false
+	close(bp.reaperStopCh)
+}
+
+func (bp *BackendPool) checkExpired() {
+	now := time.Now()
+
+	bp.mu.RLock()
+	backends := make([]*Backend, len(bp.backends))
+	copy(backends, bp.backends)
+	globalExpires := bp.globalRateLimitExpiresAt
+	bp.mu.RUnlock()
+
+	if !globalExpires.IsZero() && now.After(globalExpires) {
+		bp.mu.Lock()
+		if !bp.globalRateLimitExpiresAt.IsZero() && now.After(bp.globalRateLimitExpiresAt) {
+			bp.DisableGlobalRateLimit()
+			bp.globalRateLimitExpiresAt = time.Time{}
+			bp.eventBus.Record("global", EventRateLimitExpired, "global rate limit auto-expired")
+		}
+		bp.mu.Unlock()
+	}
+
+	for _, b := range backends {
+		rlExpires := b.RateLimitExpiresAt()
+		if !rlExpires.IsZero() && now.After(rlExpires) {
+			b.mu.Lock()
+			if !b.rateLimitExpiresAt.IsZero() && now.After(b.rateLimitExpiresAt) {
+				b.DisableRateLimit()
+				b.rateLimitExpiresAt = time.Time{}
+				if b.eventBus != nil {
+					b.eventBus.Record(b.Name, EventRateLimitExpired, "rate limit auto-expired")
+				}
+			}
+			b.mu.Unlock()
+		}
+
+		circuitExpires := b.CircuitManualExpiresAt()
+		if !circuitExpires.IsZero() && now.After(circuitExpires) {
+			b.mu.Lock()
+			if !b.circuitManualExpiresAt.IsZero() && now.After(b.circuitManualExpiresAt) {
+				b.SetManualCircuitOpen(false, "", 0)
+				if b.eventBus != nil {
+					b.eventBus.Record(b.Name, EventCircuitExpired, "manual circuit auto-expired")
+				}
+			}
+			b.mu.Unlock()
+		}
+	}
+}
+
+func (bp *BackendPool) RecordEvent(backend string, typ EventType, detail string) {
+	bp.eventBus.Record(backend, typ, detail)
+}
+
+func (bp *BackendPool) Events(backendFilter string) []Event {
+	return bp.eventBus.List(backendFilter)
 }
 
 func (bp *BackendPool) TryAcquireGlobalRateLimit() bool {
@@ -726,14 +960,34 @@ func (bp *BackendPool) TryAcquireGlobalRateLimit() bool {
 	return ok
 }
 
-func (bp *BackendPool) SetGlobalRateLimit(capacity int64, refillAmount int64, refillInterval time.Duration) {
+func (bp *BackendPool) SetGlobalRateLimit(capacity int64, refillAmount int64, refillInterval time.Duration, ttl time.Duration) {
+	bp.mu.Lock()
+	if ttl > 0 {
+		bp.globalRateLimitExpiresAt = time.Now().Add(ttl)
+	} else {
+		bp.globalRateLimitExpiresAt = time.Time{}
+	}
+	bp.mu.Unlock()
+
 	bp.rateLimiter.SetLimit(capacity, refillAmount, refillInterval)
-	fmt.Printf("Global rate limit set: capacity=%d, refill=%d/%s\n", capacity, refillAmount, refillInterval)
+	detail := fmt.Sprintf("capacity=%d, refill=%d/%s", capacity, refillAmount, refillInterval)
+	if ttl > 0 {
+		detail += fmt.Sprintf(", ttl=%s", ttl)
+	}
+	fmt.Printf("Global rate limit set: %s\n", detail)
+	bp.eventBus.Record("global", EventRateLimitSet, detail)
+}
+
+func (bp *BackendPool) GlobalRateLimitExpiresAt() time.Time {
+	bp.mu.RLock()
+	defer bp.mu.RUnlock()
+	return bp.globalRateLimitExpiresAt
 }
 
 func (bp *BackendPool) DisableGlobalRateLimit() {
 	bp.rateLimiter.Disable()
 	fmt.Println("Global rate limit disabled")
+	bp.eventBus.Record("global", EventRateLimitDisabled, "disabled via API")
 }
 
 func (bp *BackendPool) GlobalRateLimitConfig() (capacity int64, refillAmount int64, refillInterval time.Duration, enabled bool) {
@@ -787,6 +1041,7 @@ func (bp *BackendPool) EligibleBackends() []*Backend {
 func (bp *BackendPool) AddBackend(b *Backend) {
 	bp.mu.Lock()
 	defer bp.mu.Unlock()
+	b.eventBus = bp.eventBus
 	bp.backends = append(bp.backends, b)
 }
 
@@ -810,6 +1065,81 @@ func (bp *BackendPool) GetBackend(name string) *Backend {
 		}
 	}
 	return nil
+}
+
+type EventType string
+
+const (
+	EventMaintenanceOn     EventType = "maintenance_on"
+	EventMaintenanceOff    EventType = "maintenance_off"
+	EventRateLimitSet      EventType = "rate_limit_set"
+	EventRateLimitDisabled EventType = "rate_limit_disabled"
+	EventRateLimitExpired  EventType = "rate_limit_expired"
+	EventRateLimitHit      EventType = "rate_limit_hit"
+	EventCircuitOpened     EventType = "circuit_opened"
+	EventCircuitClosed     EventType = "circuit_closed"
+	EventCircuitHalfOpen   EventType = "circuit_half_open"
+	EventCircuitManualOpen EventType = "circuit_manual_open"
+	EventCircuitManualClose EventType = "circuit_manual_close"
+	EventCircuitExpired    EventType = "circuit_expired"
+	EventHCHealthy         EventType = "hc_healthy"
+	EventHCUnhealthy       EventType = "hc_unhealthy"
+	EventHCVersionUpdated  EventType = "hc_version_updated"
+)
+
+type Event struct {
+	ID        int64     `json:"id"`
+	Timestamp time.Time `json:"timestamp"`
+	Type      EventType `json:"type"`
+	Backend   string    `json:"backend"`
+	Detail    string    `json:"detail"`
+}
+
+type EventBus struct {
+	mu       sync.Mutex
+	events   []Event
+	capacity int
+	nextID   int64
+}
+
+func NewEventBus(capacity int) *EventBus {
+	return &EventBus{
+		events:   make([]Event, 0, capacity),
+		capacity: capacity,
+	}
+}
+
+func (eb *EventBus) Record(backend string, typ EventType, detail string) {
+	eb.mu.Lock()
+	defer eb.mu.Unlock()
+
+	eb.nextID++
+	e := Event{
+		ID:        eb.nextID,
+		Timestamp: time.Now(),
+		Type:      typ,
+		Backend:   backend,
+		Detail:    detail,
+	}
+
+	if len(eb.events) >= eb.capacity {
+		eb.events = eb.events[1:]
+	}
+	eb.events = append(eb.events, e)
+}
+
+func (eb *EventBus) List(backendFilter string) []Event {
+	eb.mu.Lock()
+	defer eb.mu.Unlock()
+
+	result := make([]Event, 0, len(eb.events))
+	for i := len(eb.events) - 1; i >= 0; i-- {
+		e := eb.events[i]
+		if backendFilter == "" || e.Backend == backendFilter {
+			result = append(result, e)
+		}
+	}
+	return result
 }
 
 type PoolStats struct {
